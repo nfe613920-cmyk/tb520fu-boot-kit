@@ -1,0 +1,102 @@
+#!/bin/busybox sh
+
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts
+mount -t tmpfs tmpfs /run
+mkdir -p /sys/kernel/config
+mount -t configfs configfs /sys/kernel/config 2>/dev/null
+
+exec </dev/console >/dev/console 2>&1
+
+echo
+echo "TB520FU mainline initramfs"
+echo "kernel: $(uname -a)"
+echo "cmdline: $(cat /proc/cmdline)"
+
+echo /sbin/mdev > /proc/sys/kernel/hotplug
+mdev -s
+
+root_device=/dev/sda16
+debug_shell=0
+
+for argument in $(cat /proc/cmdline); do
+    case "$argument" in
+        root=/dev/*)
+            root_device=${argument#root=}
+            ;;
+        rd.shell=1)
+            debug_shell=1
+            ;;
+    esac
+done
+
+usb_shell()
+{
+    wait_count=0
+    while [ ! -c /dev/ttyGS0 ] && [ "$wait_count" -lt 30 ]; do
+        echo "waiting for /dev/ttyGS0 ($wait_count/30)"
+        sleep 1
+        wait_count=$((wait_count + 1))
+        mdev -s
+    done
+
+    echo "TB520FU_USB_SHELL_READY"
+    echo "kernel: $(uname -a)"
+
+    while true; do
+        if [ -c /dev/ttyGS0 ]; then
+            /bin/sh -i </dev/ttyGS0 >/dev/ttyGS0 2>&1
+        else
+            /bin/sh -i </dev/console >/dev/console 2>&1
+        fi
+        sleep 1
+    done
+}
+
+if [ "$debug_shell" -eq 1 ]; then
+    echo "rd.shell=1 requested; entering debug shell loop"
+    usb_shell
+fi
+
+wait_count=0
+while [ ! -b "$root_device" ] && [ "$wait_count" -lt 30 ]; do
+    echo "waiting for root block device $root_device ($wait_count/30)"
+    sleep 1
+    wait_count=$((wait_count + 1))
+    mdev -s
+done
+
+if [ ! -b "$root_device" ]; then
+    echo "ERROR: root block device $root_device was not found"
+    echo "available SCSI-style block devices:"
+    ls -l /dev/sd* 2>/dev/null
+    usb_shell
+fi
+
+if ! mount -t ext4 -o rw "$root_device" /newroot; then
+    echo "ERROR: failed to mount $root_device on /newroot"
+    usb_shell
+fi
+
+if [ ! -x /newroot/sbin/init ]; then
+    echo "ERROR: /newroot/sbin/init is absent or not executable"
+    usb_shell
+fi
+
+echo "switching to Arch Linux root on $root_device"
+mount --move /proc /newroot/proc
+mount --move /sys /newroot/sys
+mount --move /dev /newroot/dev
+mount --move /run /newroot/run
+exec switch_root /newroot /sbin/init
+
+echo "ERROR: switch_root returned unexpectedly"
+while true; do
+    /bin/sh -i </dev/console >/dev/console 2>&1 || true
+    sleep 1
+done
